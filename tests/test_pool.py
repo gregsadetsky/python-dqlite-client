@@ -427,3 +427,82 @@ async def test_cancelled_initialize_closes_the_connections_it_opened(make_pool: 
     assert not proto.is_alive
     assert not opened.is_connected
     await pool.close()
+
+
+async def _steps(n: int = 10) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+async def test_second_cancel_while_release_waits_for_the_lock(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=0, max_size=1, timeout=0.5)
+
+    async def leave_a_transaction_open() -> None:
+        async with pool.acquire() as conn:
+            await conn.execute("BEGIN")
+            factory.created[-1][1].hang.add("ROLLBACK")
+
+    task = asyncio.create_task(leave_a_transaction_open())
+    while not factory.created or factory.created[-1][1].sent[-1:] != ["ROLLBACK"]:
+        await asyncio.sleep(0)
+    async with pool._condition:
+        task.cancel()
+        await _steps()
+        assert not task.done()
+        task.cancel()
+        await _steps()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _steps()
+    assert pool._size == 0
+    assert not factory.created[0][1].is_alive
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
+
+
+async def test_second_cancel_while_initialize_cleans_up(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=2, max_size=2, timeout=0.5)
+    factory.hang_from = 1
+    task = asyncio.create_task(pool.initialize())
+    await factory.hanging.wait()
+    async with pool._condition:
+        task.cancel()
+        await _steps()
+        assert not task.done()
+        task.cancel()
+        await _steps()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _steps()
+    assert pool._size == 0
+    assert not factory.created[0][1].is_alive
+    factory.hang_from = None
+    await pool.initialize()
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
+
+
+async def test_cancel_while_initialize_files_its_connections(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=1, max_size=1, timeout=0.5)
+    async with pool._condition:
+        task = asyncio.create_task(pool.initialize())
+        await _steps()
+    # initialize() now holds its slot; take the lock again before it can file the connection
+    async with pool._condition:
+        while not factory.created:
+            await asyncio.sleep(0)
+        await _steps()
+        assert not task.done()
+        task.cancel()
+        await _steps()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _steps()
+    assert pool._size == len(pool._idle)
+    if not pool._idle:
+        assert not factory.created[0][1].is_alive
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
