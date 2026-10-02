@@ -1,5 +1,6 @@
 """Pytest configuration for dqlite-client tests."""
 
+import asyncio
 import contextlib
 import sys
 from collections.abc import AsyncIterator
@@ -101,12 +102,15 @@ class FakeProtocol:
         self.is_alive = True
         self.sent: list[str] = []
         self.fail_with: dict[str, BaseException] = {}
+        self.hang: set[str] = set()
 
     async def exec_sql(self, db_id: int, sql: str, params: Any) -> tuple[int, int]:
         self.sent.append(sql)
         keyword = sql.split()[0].upper()
         if keyword in self.fail_with:
             raise self.fail_with[keyword]
+        if keyword in self.hang:
+            await asyncio.Event().wait()
         return (0, 0)
 
     async def query_sql(
