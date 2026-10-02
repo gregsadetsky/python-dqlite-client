@@ -35,6 +35,9 @@ from dqlitewire.constants import TX_AUTO_ROLLBACK_PRIMARY_CODES
         (["/* c */ BEGIN; INSERT INTO t VALUES (1); COMMIT"], False),
         (["BEGIN; INSERT INTO t VALUES (1)"], True),
         (["INSERT INTO t VALUES (1)"], False),
+        (["/* c */ \ufeffBEGIN"], True),
+        (["  \ufeffBEGIN"], True),
+        (["-- c\n\ufeff /* d */ BEGIN"], True),
     ],
 )
 async def test_transaction_flag_follows_the_tracking_table(
@@ -78,6 +81,66 @@ async def test_failed_statement_leaves_flag_alone(connected: Any) -> None:
     with pytest.raises(OperationalError):
         await conn.execute("INSERT INTO t VALUES (1)")
     assert conn.in_transaction is True
+
+
+CONSTRAINT = OperationalError("UNIQUE constraint failed", code=1555)
+
+
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [
+        ("BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)", True),
+        ("SAVEPOINT a; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)", True),
+        ("/* c */ \ufeffBEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)", True),
+        # conservative: the batch may have failed before BEGIN or after COMMIT
+        ("INSERT INTO t VALUES (1); BEGIN", True),
+        ("BEGIN; COMMIT; INSERT INTO t VALUES (1)", True),
+        ("INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)", False),
+    ],
+)
+async def test_failed_batch_reports_a_transaction_it_may_have_opened(
+    connected: Any, batch: str, expected: bool
+) -> None:
+    conn, proto = connected()
+    proto.fail_with[batch.split()[0].upper()] = CONSTRAINT
+    with pytest.raises(OperationalError):
+        await conn.execute(batch)
+    assert conn.in_transaction is expected
+    assert conn.is_connected
+
+
+async def test_failed_batch_with_auto_rollback_code_reports_no_transaction(connected: Any) -> None:
+    conn, proto = connected()
+    proto.fail_with["BEGIN;"] = OperationalError(
+        "full", code=next(iter(TX_AUTO_ROLLBACK_PRIMARY_CODES))
+    )
+    with pytest.raises(OperationalError):
+        await conn.execute("BEGIN; INSERT INTO t VALUES (1)")
+    assert conn.in_transaction is False
+
+
+async def test_failed_batch_that_loses_the_session_reports_no_transaction(connected: Any) -> None:
+    conn, proto = connected()
+    proto.fail_with["BEGIN;"] = OperationalError("not leader", code=next(iter(LEADER_ERROR_CODES)))
+    with pytest.raises(OperationalError):
+        await conn.execute("BEGIN; INSERT INTO t VALUES (1)")
+    assert not conn.is_connected
+    assert conn.in_transaction is False
+
+
+async def test_transaction_refused_after_failed_batch_until_rollback(connected: Any) -> None:
+    conn, proto = connected()
+    proto.fail_with["INSERT"] = CONSTRAINT
+    with pytest.raises(OperationalError):
+        await conn.execute("INSERT INTO t VALUES (1); BEGIN")
+    del proto.fail_with["INSERT"]
+    with pytest.raises(InterfaceError, match="Nested"):
+        async with conn.transaction():
+            pass
+    await conn.execute("ROLLBACK")
+    async with conn.transaction():
+        await conn.execute("INSERT INTO t VALUES (2)")
+    assert conn.in_transaction is False
 
 
 @pytest.mark.parametrize(
