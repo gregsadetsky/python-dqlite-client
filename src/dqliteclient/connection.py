@@ -399,9 +399,23 @@ class DqliteConnection:
     async def execute(self, sql: str, params: Sequence[Any] | None = None) -> tuple[int, int]:
         """Execute a statement; return ``(last_insert_id, rows_affected)``."""
         self._validate_params(params)
-        result = await self._run(lambda p, db: p.exec_sql(db, sql, params))
+        try:
+            result = await self._run(lambda p, db: p.exec_sql(db, sql, params))
+        except OperationalError as exc:
+            self._track_failed_batch(sql, exc)
+            raise
         self._track_transaction(sql)
         return result
+
+    def _track_failed_batch(self, sql: str, exc: OperationalError) -> None:
+        """Set the flag if a failed multi-statement request may have opened a transaction."""
+        if self._protocol is None:
+            return
+        statements = split_statements(sql)
+        if len(statements) < 2 or primary_sqlite_code(exc.code) in TX_AUTO_ROLLBACK_PRIMARY_CODES:
+            return
+        if any(leading_keyword(s) in ("BEGIN", "SAVEPOINT") for s in statements):
+            self._in_transaction = True
 
     async def query_raw(
         self, sql: str, params: Sequence[Any] | None = None

@@ -62,13 +62,20 @@ connection sends, and it is deliberately conservative:
 | `COMMIT`, `END`, `ROLLBACK` (without `TO`) | clear |
 | `RELEASE`, `ROLLBACK TO` | unchanged |
 | a server reply whose result code means SQLite rolled back on its own | clear |
+| a failed multi-statement request containing `BEGIN` or `SAVEPOINT` | set |
 
-The one case where the flag over-reports is releasing the outermost savepoint
-opened outside a `BEGIN`: the engine is back in autocommit but the flag stays
-set until the next `COMMIT` or `ROLLBACK`. The only cost is one `ROLLBACK`
-the server answers with "no transaction is active", which the pool and
-`transaction()` treat as success. Multi-statement input is split and every
-piece is applied in order.
+Multi-statement input is split and every piece is applied in order. The server
+stops at the first failing piece and keeps the ones before it, so a failed
+request may have opened a transaction; which pieces ran is not reported, so
+the flag is set whenever one of them could have.
+
+The flag over-reports in two cases: releasing the outermost savepoint opened
+outside a `BEGIN` (the engine is back in autocommit but the flag stays set
+until the next `COMMIT` or `ROLLBACK`), and a failed multi-statement request
+that never reached its `BEGIN` or had already committed. The pool's release
+`ROLLBACK` then gets "no transaction is active", which it treats as clean;
+`transaction()` refuses to start ("Nested transactions are not supported")
+until a `ROLLBACK` clears the flag.
 
 ## Leader discovery
 
