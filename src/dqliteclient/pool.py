@@ -172,9 +172,18 @@ class ConnectionPool:
         async with self._condition:
             wanted = max(0, self._min_size - self._size)
             self._size += wanted
-        results = await asyncio.gather(
-            *(self._create_connection() for _ in range(wanted)), return_exceptions=True
-        )
+        tasks = [asyncio.ensure_future(self._create_connection()) for _ in range(wanted)]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            async with self._condition:
+                self._size -= wanted
+                self._condition.notify_all()
+            self._initialized = False
+            for task in tasks:
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    task.result().terminate()
+            raise
         opened = [r for r in results if isinstance(r, DqliteConnection)]
         failures = [r for r in results if isinstance(r, BaseException)]
         async with self._condition:
@@ -256,16 +265,19 @@ class ConnectionPool:
     async def _release(self, conn: DqliteConnection) -> None:
         if get_current_pid() != self._pid:
             return
-        keep = await self._reset(conn)
-        async with self._condition:
-            if keep and not self.closed:
-                self._idle.append(conn)
-            else:
-                keep = False
-                self._size -= 1
-            self._condition.notify()
-        if not keep:
-            await self._close_quietly(conn)
+        keep = False
+        try:
+            keep = await self._reset(conn)
+        finally:
+            async with self._condition:
+                if keep and not self.closed:
+                    self._idle.append(conn)
+                else:
+                    keep = False
+                    self._size -= 1
+                self._condition.notify()
+            if not keep:
+                await self._close_quietly(conn)
 
     async def _reset(self, conn: DqliteConnection) -> bool:
         """Roll back a possibly open transaction; False if the connection should be dropped."""
