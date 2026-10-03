@@ -427,3 +427,63 @@ async def test_cancelled_initialize_closes_the_connections_it_opened(make_pool: 
     assert not proto.is_alive
     assert not opened.is_connected
     await pool.close()
+
+
+def _runs_without_yielding(coro: Any) -> bool:
+    """True if the coroutine finishes on its first step, i.e. it can't be cancelled midway."""
+    try:
+        coro.send(None)
+    except StopIteration:
+        return True
+    coro.close()
+    return False
+
+
+async def test_pool_bookkeeping_never_yields(make_pool: Any) -> None:
+    # The cancel handling in _acquire, _release and initialize() relies on this: the lock
+    # is never held across an await, so taking it never suspends.
+    pool, _ = make_pool(min_size=1, max_size=1)
+    await pool.initialize()
+    conn = pool._idle[0]
+    assert _runs_without_yielding(pool._acquire())
+    assert _runs_without_yielding(pool._release(conn))
+    assert pool._size == 1 and pool._idle == [conn]
+    await pool.close()
+
+
+async def test_cancelled_close_still_closes_idle_connections(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=2, max_size=2)
+    await pool.initialize()
+    task = asyncio.create_task(pool.close())
+    await asyncio.sleep(0)  # close() has taken the idle list and waits on the closes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await pool.close()  # a second close() is a no-op, the pool is already closed
+    assert [proto.is_alive for _, proto in factory.created] == [False, False]
+
+
+@pytest.mark.parametrize("steps", range(8))
+async def test_cancelled_initialize_cleanup_still_closes_what_it_opened(
+    make_pool: Any, steps: int
+) -> None:
+    # One connect fails, so initialize() closes the other one; cancel it at every step.
+    pool, factory = make_pool(min_size=2, max_size=2)
+    original = factory.__call__
+
+    async def one_fails() -> DqliteConnection:
+        if factory.calls == 0:
+            factory.calls += 1
+            raise OSError("refused")
+        conn: DqliteConnection = await original()
+        return conn
+
+    pool._create_connection = one_fails
+    task = asyncio.create_task(pool.initialize())
+    for _ in range(steps):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, OSError)):
+        await task
+    assert pool._size == 0
+    assert not any(proto.is_alive for _, proto in factory.created)
