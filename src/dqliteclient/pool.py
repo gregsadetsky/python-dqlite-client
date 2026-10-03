@@ -194,7 +194,7 @@ class ConnectionPool:
             self._condition.notify_all()
         if failures or self.closed:
             self._initialized = False
-            await asyncio.gather(*(c.close() for c in opened), return_exceptions=True)
+            await self._close_all(opened)
             for failure in failures:
                 if isinstance(failure, asyncio.CancelledError | KeyboardInterrupt | SystemExit):
                     raise failure
@@ -301,6 +301,15 @@ class ConnectionPool:
             logger.debug("pool: close failed", exc_info=True)
             conn.terminate()
 
+    async def _close_all(self, conns: list[DqliteConnection]) -> None:
+        try:
+            await asyncio.gather(*(self._close_quietly(c) for c in conns), return_exceptions=True)
+        except BaseException:
+            # Cancelled, maybe before the closes ran; nothing else holds these, so drop them.
+            for conn in conns:
+                conn.terminate()
+            raise
+
     async def close(self) -> None:
         """Close idle connections; checked-out ones close when returned. Idempotent."""
         if self.closed:
@@ -313,7 +322,7 @@ class ConnectionPool:
             idle, self._idle = self._idle, []
             self._size -= len(idle)
             self._condition.notify_all()
-        await asyncio.gather(*(self._close_quietly(c) for c in idle), return_exceptions=True)
+        await self._close_all(idle)
 
     # -- convenience -------------------------------------------------------------
 
