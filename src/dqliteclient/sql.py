@@ -37,10 +37,12 @@ def is_keyword_boundary(s: str, kw_len: int) -> bool:
 
 
 def strip_leading_comments(sql: str) -> str:
-    """Strip leading whitespace, a UTF-8 BOM, and ``--`` / ``/* */`` comments."""
-    s = sql.lstrip("﻿").strip()
+    """Strip leading whitespace, UTF-8 BOMs, and ``--`` / ``/* */`` comments, in any order."""
+    s = sql.strip()
     while True:
-        if s.startswith("--"):
+        if s.startswith("\ufeff"):
+            s = s[1:].lstrip()
+        elif s.startswith("--"):
             newline = s.find("\n")
             if newline == -1:
                 return ""

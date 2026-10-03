@@ -77,6 +77,15 @@ async def test_release_rolls_back_open_transaction(make_pool: Any) -> None:
     await pool.close()
 
 
+async def test_release_rolls_back_transaction_opened_through_a_query(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=0, max_size=1)
+    async with pool.acquire() as conn:
+        await conn.query_raw("BEGIN")
+    assert factory.created[0][1].sent[-1] == "ROLLBACK"
+    assert conn.in_transaction is False
+    await pool.close()
+
+
 async def test_release_drops_connection_when_rollback_fails(make_pool: Any) -> None:
     pool, factory = make_pool(min_size=0, max_size=1)
     async with pool.acquire() as conn:
