@@ -23,10 +23,17 @@ class Factory:
         self._connected = connected
         self.created: list[tuple[DqliteConnection, Any]] = []
         self.fail: Exception | None = None
+        self.calls = 0
+        self.hang_from: int | None = None
+        self.hanging = asyncio.Event()
 
     async def __call__(self) -> DqliteConnection:
+        self.calls += 1
         if self.fail is not None:
             raise self.fail
+        if self.hang_from is not None and self.calls > self.hang_from:
+            self.hanging.set()
+            await asyncio.Event().wait()
         conn, proto = self._connected()
         self.created.append((conn, proto))
         assert isinstance(conn, DqliteConnection)
@@ -359,3 +366,124 @@ async def test_cluster_connect_max_attempts_rejects_bool() -> None:
     cluster = ClusterClient(MemoryNodeStore())
     with pytest.raises(TypeError, match="max_attempts must be int"):
         await cluster.connect(database="x", max_attempts=True)
+
+
+async def _cancel_during_release_rollback(pool: ConnectionPool, factory: Factory) -> None:
+    async def leave_a_transaction_open() -> None:
+        async with pool.acquire() as conn:
+            await conn.execute("BEGIN")
+            factory.created[-1][1].hang.add("ROLLBACK")
+
+    before = len(factory.created)
+    task = asyncio.create_task(leave_a_transaction_open())
+    while len(factory.created) == before or factory.created[-1][1].sent[-1:] != ["ROLLBACK"]:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_cancel_during_release_rollback_gives_the_slot_back(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=0, max_size=1, timeout=0.5)
+    await _cancel_during_release_rollback(pool, factory)
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
+
+
+async def test_repeated_release_cancels_do_not_exhaust_the_pool(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=0, max_size=2, timeout=0.5)
+    for _ in range(2):
+        await _cancel_during_release_rollback(pool, factory)
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
+
+
+async def test_cancelled_initialize_gives_the_slots_back(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=1, max_size=1, timeout=0.5)
+    factory.hang_from = 0
+    task = asyncio.create_task(pool.initialize())
+    await factory.hanging.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    factory.hang_from = None
+    await pool.initialize()
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT 1") == 1
+    await pool.close()
+
+
+async def test_cancelled_initialize_closes_the_connections_it_opened(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=2, max_size=2, timeout=0.5)
+    factory.hang_from = 1
+    task = asyncio.create_task(pool.initialize())
+    await factory.hanging.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    opened, proto = factory.created[0]
+    assert not proto.is_alive
+    assert not opened.is_connected
+    await pool.close()
+
+
+def _runs_without_yielding(coro: Any) -> bool:
+    """True if the coroutine finishes on its first step, i.e. it can't be cancelled midway."""
+    try:
+        coro.send(None)
+    except StopIteration:
+        return True
+    coro.close()
+    return False
+
+
+async def test_pool_bookkeeping_never_yields(make_pool: Any) -> None:
+    # The cancel handling in _acquire, _release and initialize() relies on this: the lock
+    # is never held across an await, so taking it never suspends.
+    pool, _ = make_pool(min_size=1, max_size=1)
+    await pool.initialize()
+    conn = pool._idle[0]
+    assert _runs_without_yielding(pool._acquire())
+    assert _runs_without_yielding(pool._release(conn))
+    assert pool._size == 1 and pool._idle == [conn]
+    await pool.close()
+
+
+async def test_cancelled_close_still_closes_idle_connections(make_pool: Any) -> None:
+    pool, factory = make_pool(min_size=2, max_size=2)
+    await pool.initialize()
+    task = asyncio.create_task(pool.close())
+    await asyncio.sleep(0)  # close() has taken the idle list and waits on the closes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await pool.close()  # a second close() is a no-op, the pool is already closed
+    assert [proto.is_alive for _, proto in factory.created] == [False, False]
+
+
+@pytest.mark.parametrize("steps", range(8))
+async def test_cancelled_initialize_cleanup_still_closes_what_it_opened(
+    make_pool: Any, steps: int
+) -> None:
+    # One connect fails, so initialize() closes the other one; cancel it at every step.
+    pool, factory = make_pool(min_size=2, max_size=2)
+    original = factory.__call__
+
+    async def one_fails() -> DqliteConnection:
+        if factory.calls == 0:
+            factory.calls += 1
+            raise OSError("refused")
+        conn: DqliteConnection = await original()
+        return conn
+
+    pool._create_connection = one_fails
+    task = asyncio.create_task(pool.initialize())
+    for _ in range(steps):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, OSError)):
+        await task
+    assert pool._size == 0
+    assert not any(proto.is_alive for _, proto in factory.created)
