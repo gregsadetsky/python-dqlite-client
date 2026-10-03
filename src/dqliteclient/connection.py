@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import warnings
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence, Sized
@@ -21,6 +22,7 @@ from dqliteclient._validate import (
 )
 from dqliteclient.exceptions import (
     AmbiguousCommitError,
+    AmbiguousConnectionError,
     DataError,
     DqliteConnectionError,
     InterfaceError,
@@ -29,6 +31,7 @@ from dqliteclient.exceptions import (
 )
 from dqliteclient.protocol import DqliteProtocol, validate_positive_int_or_none
 from dqliteclient.sql import (
+    blank_literals_and_comments,
     is_keyword_boundary,
     leading_keyword,
     split_statements,
@@ -56,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 _LEADERSHIP_LOST_CODES: Final[frozenset[int]] = frozenset(
     {SQLITE_IOERR_LEADERSHIP_LOST, SQLITE_IOERR_LEADERSHIP_LOST_LEGACY}
+)
+_READ_KEYWORDS: Final[frozenset[str]] = frozenset({"", "SELECT", "VALUES", "EXPLAIN"})
+_DML_WORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE
 )
 
 
@@ -355,19 +362,39 @@ class DqliteConnection:
 
     # -- RPC plumbing --------------------------------------------------------------
 
-    async def _run[T](self, fn: Callable[[DqliteProtocol, int], Awaitable[T]]) -> T:
+    async def _run[T](
+        self, fn: Callable[[DqliteProtocol, int], Awaitable[T]], sql: str | None = None
+    ) -> T:
         with self._operation():
             if self._protocol is None or self._db_id is None:
                 raise DqliteConnectionError("Not connected")
+            in_transaction = self._in_transaction
             try:
                 return await fn(self._protocol, self._db_id)
             except EncodeError as exc:
                 raise DataError(f"wire encode failed: {exc}") from exc
-            except (DqliteConnectionError, ProtocolError):
+            except (DqliteConnectionError, ProtocolError) as exc:
                 self._invalidate()
+                if sql is not None and may_commit(sql, in_transaction):
+                    raise AmbiguousConnectionError(
+                        f"connection lost before the reply; the write may or may not have "
+                        f"been applied: {exc}",
+                        raw_message=exc.raw_message,
+                    ) from exc
                 raise
             except OperationalError as exc:
                 self._on_operational_error(exc)
+                if (
+                    exc.code in _LEADERSHIP_LOST_CODES
+                    and sql is not None
+                    and may_commit(sql, in_transaction)
+                ):
+                    raise AmbiguousCommitError(
+                        f"leadership lost; the write may or may not have been applied: "
+                        f"{exc.message}",
+                        exc.code,
+                        raw_message=exc.raw_message,
+                    ) from exc
                 raise
             except BaseException:
                 # Cancelled or interrupted mid round-trip: the wire position is unknown.
@@ -399,7 +426,7 @@ class DqliteConnection:
     async def execute(self, sql: str, params: Sequence[Any] | None = None) -> tuple[int, int]:
         """Execute a statement; return ``(last_insert_id, rows_affected)``."""
         self._validate_params(params)
-        result = await self._run(lambda p, db: p.exec_sql(db, sql, params))
+        result = await self._run(lambda p, db: p.exec_sql(db, sql, params), sql)
         self._track_transaction(sql)
         return result
 
@@ -408,7 +435,7 @@ class DqliteConnection:
     ) -> tuple[list[str], list[list[Any]]]:
         """Run a query; return ``(column_names, rows)``."""
         self._validate_params(params)
-        return await self._run(lambda p, db: p.query_sql(db, sql, params))
+        return await self._run(lambda p, db: p.query_sql(db, sql, params), sql)
 
     async def query_raw_typed(
         self, sql: str, params: Sequence[Any] | None = None
@@ -416,7 +443,7 @@ class DqliteConnection:
         """Run a query; return ``(column_names, column_types, row_types, rows)`` with wire
         ``ValueType`` codes per column (first row) and per row."""
         self._validate_params(params)
-        return await self._run(lambda p, db: p.query_sql_typed(db, sql, params))
+        return await self._run(lambda p, db: p.query_sql_typed(db, sql, params), sql)
 
     async def fetch(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         columns, rows = await self.query_raw(sql, params)
@@ -442,8 +469,8 @@ class DqliteConnection:
     async def transaction(self) -> AsyncIterator[None]:
         """``BEGIN`` on entry, ``COMMIT`` on clean exit, ``ROLLBACK`` if the body raises.
 
-        Losing leadership during ``COMMIT`` raises :class:`AmbiguousCommitError`: the
-        write may or may not have been applied.
+        Losing leadership or the session during ``COMMIT`` raises
+        :class:`AmbiguousCommitError`: the write may or may not have been applied.
         """
         if self._in_transaction:
             raise InterfaceError("Nested transactions are not supported; use SAVEPOINT directly")
@@ -453,17 +480,7 @@ class DqliteConnection:
         except BaseException:
             await self._rollback_after()
             raise
-        try:
-            await self.execute("COMMIT")
-        except OperationalError as exc:
-            if exc.code in _LEADERSHIP_LOST_CODES:
-                raise AmbiguousCommitError(
-                    f"leadership lost during COMMIT; the transaction may or may not have "
-                    f"been applied: {exc.message}",
-                    exc.code,
-                    raw_message=exc.raw_message,
-                ) from exc
-            raise
+        await self.execute("COMMIT")
 
     async def _rollback_after(self) -> None:
         where = f"(address={sanitize_for_log(self._address)}, id={id(self)})"
@@ -480,6 +497,32 @@ class DqliteConnection:
         except Exception:
             logger.debug("transaction rollback failed %s", where, exc_info=True)
             self._invalidate()
+
+
+def may_commit(sql: str, in_transaction: bool) -> bool:
+    """True if running ``sql`` from this transaction state can commit a write: it reaches
+    ``COMMIT``, ``END`` or ``RELEASE``, or a write outside a transaction."""
+    for statement in split_statements(sql):
+        keyword = leading_keyword(statement)
+        if keyword in ("COMMIT", "END", "RELEASE"):
+            return True
+        if keyword in ("BEGIN", "SAVEPOINT"):
+            in_transaction = True
+        elif keyword == "ROLLBACK":
+            in_transaction = in_transaction and _is_rollback_to(statement)
+        elif not in_transaction and _is_write(statement):
+            return True
+    return False
+
+
+def _is_write(statement: str) -> bool:
+    blanked = blank_literals_and_comments(statement)
+    keyword = leading_keyword(blanked)
+    if keyword == "PRAGMA":
+        return "=" in blanked or "(" in blanked
+    if keyword == "WITH":
+        return _DML_WORD_RE.search(blanked) is not None
+    return keyword not in _READ_KEYWORDS
 
 
 def _is_rollback_to(statement: str) -> bool:

@@ -9,6 +9,7 @@ from dqlitewire import sanitize_server_text as _sanitize_server_text
 
 __all__ = [
     "AmbiguousCommitError",
+    "AmbiguousConnectionError",
     "ClusterError",
     "ClusterPolicyError",
     "DataError",
@@ -160,8 +161,18 @@ class OperationalError(DqliteError):
 
 
 class AmbiguousCommitError(OperationalError):
-    """COMMIT mid-flight failure with genuinely unknown server-side state.
+    """A write that commits (COMMIT, RELEASE, or a write outside a transaction) failed with
+    unknown server-side state.
 
     The Raft entry may or may not have been replicated; the client cannot tell from the wire.
     Retries MUST be treated as at-least-once (use idempotent DML or an out-of-band state check).
     """
+
+
+class AmbiguousConnectionError(DqliteConnectionError, AmbiguousCommitError):  # type: ignore[misc]
+    """The session broke before the reply to a write that commits; ``code`` is ``None``."""
+
+    def __init__(
+        self, message: str, code: int | None = None, *, raw_message: str | None = None
+    ) -> None:
+        OperationalError.__init__(self, message, code, raw_message=raw_message)  # type: ignore[arg-type]
