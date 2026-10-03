@@ -54,7 +54,8 @@ dqlitewire          codec
 ## Transaction tracking
 
 `in_transaction` is a local flag maintained from the statements the
-connection sends, and it is deliberately conservative:
+connection sends, through `execute` and the query methods alike, and it is
+deliberately conservative:
 
 | Statement | Effect on the flag |
 | --- | --- |

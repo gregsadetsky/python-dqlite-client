@@ -422,7 +422,9 @@ class DqliteConnection:
     ) -> tuple[list[str], list[list[Any]]]:
         """Run a query; return ``(column_names, rows)``."""
         self._validate_params(params)
-        return await self._run(lambda p, db: p.query_sql(db, sql, params))
+        result = await self._run(lambda p, db: p.query_sql(db, sql, params))
+        self._track_transaction(sql)
+        return result
 
     async def query_raw_typed(
         self, sql: str, params: Sequence[Any] | None = None
@@ -430,7 +432,9 @@ class DqliteConnection:
         """Run a query; return ``(column_names, column_types, row_types, rows)`` with wire
         ``ValueType`` codes per column (first row) and per row."""
         self._validate_params(params)
-        return await self._run(lambda p, db: p.query_sql_typed(db, sql, params))
+        result = await self._run(lambda p, db: p.query_sql_typed(db, sql, params))
+        self._track_transaction(sql)
+        return result
 
     async def fetch(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         columns, rows = await self.query_raw(sql, params)
