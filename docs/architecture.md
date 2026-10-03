@@ -70,6 +70,29 @@ the server answers with "no transaction is active", which the pool and
 `transaction()` treat as success. Multi-statement input is split and every
 piece is applied in order.
 
+## Writes in doubt
+
+A write can be applied even though the caller gets an error: the leader
+reports leadership lost, or the session breaks after the request left (read
+timeout, reset, server close, a write or decode failure). When the request
+can commit on its own, every SQL method (`execute`, `query_raw`,
+`query_raw_typed` and the `fetch` family, so `RETURNING` too) raises
+`AmbiguousCommitError` instead, chained `from` the original error. A request
+can commit when, starting from the flag above and walking its statements, it
+reaches `COMMIT`, `END` or `RELEASE`, or a write while no transaction is open.
+A write is anything but `SELECT`, `VALUES`, `EXPLAIN`, a `PRAGMA` without an
+argument, or a `WITH` that names no `INSERT`, `UPDATE`, `DELETE` or `REPLACE`;
+unclear cases count as writes.
+
+The lost-session form is `AmbiguousConnectionError`, which is also a
+`DqliteConnectionError` (with `code` `None`), so handlers for a lost
+connection still see it; `retry_with_backoff` does not retry either form by
+default. A write inside a transaction stays a plain failure, because the
+server's transaction ends with the session, and so does a not-leader
+rejection, a request on a connection that was already gone, and a
+cancellation. The flag decides "inside a transaction", so where it
+over-reports (above) an in-doubt write is reported plainly.
+
 ## Leader discovery
 
 Discovery and redirect verification mirror go-dqlite's connector. One difference:
@@ -104,7 +127,8 @@ still checked out close when they are returned.
 | Situation | Exception |
 | --- | --- |
 | dial, handshake, read or write failure; server closed; deadline exceeded | `DqliteConnectionError` (with `code` when a leader-change result code caused it) |
-| server `FAILURE` reply to an RPC | `OperationalError(message, code)`; `AmbiguousCommitError` when leadership is lost during `COMMIT` in `transaction()` |
+| server `FAILURE` reply to an RPC | `OperationalError(message, code)`; `AmbiguousCommitError` when leadership is lost on a request that can commit (see "Writes in doubt") |
+| session lost on a request that can commit | `AmbiguousConnectionError`, both a `DqliteConnectionError` and an `AmbiguousCommitError` |
 | malformed or unexpected frame | `ProtocolError` (a `DqliteError` and a `dqlitewire.ProtocolError`) |
 | no leader found | `ClusterError`, whose message lists each node's failure |
 | redirect rejected by policy | `ClusterPolicyError` |

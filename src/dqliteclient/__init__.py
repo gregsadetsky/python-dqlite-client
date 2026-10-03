@@ -26,6 +26,7 @@ from dqliteclient.cluster import (
 from dqliteclient.connection import DqliteConnection
 from dqliteclient.exceptions import (
     AmbiguousCommitError,
+    AmbiguousConnectionError,
     ClusterError,
     ClusterPolicyError,
     DataError,
@@ -56,6 +57,7 @@ __all__ = [
     "DEFAULT_CLOSE_TIMEOUT_SECONDS",
     "DEFAULT_TIMEOUT_SECONDS",
     "AmbiguousCommitError",
+    "AmbiguousConnectionError",
     "ClusterClient",
     "ClusterError",
     "ClusterPolicyError",

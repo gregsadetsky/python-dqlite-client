@@ -8,6 +8,7 @@ from typing import Final
 
 from dqliteclient._validate import validate_max_attempts
 from dqliteclient.exceptions import (
+    AmbiguousCommitError,
     ClusterError,
     ClusterPolicyError,
     DqliteConnectionError,
@@ -30,7 +31,11 @@ _DEFAULT_RETRYABLE: Final[tuple[type[BaseException], ...]] = (
 
 # ClusterPolicyError is a deterministic ClusterError subclass (policy gate rejected an
 # address); retrying the same RPC against the same policy reproduces it, so exclude by default.
-_DEFAULT_EXCLUDED: Final[tuple[type[BaseException], ...]] = (ClusterPolicyError,)
+# AmbiguousConnectionError is a DqliteConnectionError whose write may have been applied.
+_DEFAULT_EXCLUDED: Final[tuple[type[BaseException], ...]] = (
+    ClusterPolicyError,
+    AmbiguousCommitError,
+)
 
 
 _MAX_GROUP_CHILDREN = 20
@@ -58,6 +63,8 @@ async def retry_with_backoff[T](
 
     UNSAFE for non-idempotent SQL: a transport failure can fire after the write is
     Raft-committed but before the client sees success, so retry duplicates the write.
+    The client reports that case as AmbiguousCommitError, excluded by default, when it can
+    tell the request commits (see docs/architecture.md).
     The default retryable set omits OperationalError to avoid retrying SQL-level failures.
 
     jitter must be in [0, 1) so the backoff can never be multiplied down to zero.
