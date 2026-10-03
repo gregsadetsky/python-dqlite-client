@@ -6,7 +6,7 @@ import logging
 import os
 import warnings
 import weakref
-from collections.abc import AsyncIterator, Coroutine, Sequence
+from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
 from typing import Any, NoReturn, Self
 
@@ -131,7 +131,6 @@ class ConnectionPool:
         self._condition = asyncio.Condition()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._initialized = False
-        self._cleanups: set[asyncio.Task[Any]] = set()
         self._closed_flag = [False]
         self._pid = get_current_pid()
         self._finalizer = weakref.finalize(self, _warn_if_unclosed, self._closed_flag, self._pid)
@@ -177,16 +176,25 @@ class ConnectionPool:
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except BaseException:
-            opened = [
-                task.result()
-                for task in tasks
-                if task.done() and not task.cancelled() and task.exception() is None
-            ]
-            await self._shielded(self._settle_initialize(wanted, opened, failed=True))
+            async with self._condition:
+                self._size -= wanted
+                self._condition.notify_all()
+            self._initialized = False
+            for task in tasks:
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    task.result().terminate()
             raise
         opened = [r for r in results if isinstance(r, DqliteConnection)]
         failures = [r for r in results if isinstance(r, BaseException)]
-        if await self._shielded(self._settle_initialize(wanted, opened, failed=bool(failures))):
+        async with self._condition:
+            if failures or self.closed:
+                self._size -= wanted
+            else:
+                self._idle.extend(opened)
+            self._condition.notify_all()
+        if failures or self.closed:
+            self._initialized = False
+            await asyncio.gather(*(c.close() for c in opened), return_exceptions=True)
             for failure in failures:
                 if isinstance(failure, asyncio.CancelledError | KeyboardInterrupt | SystemExit):
                     raise failure
@@ -203,21 +211,6 @@ class ConnectionPool:
                     f"pool.initialize: {len(failures)} of {wanted} connects failed", failures
                 )
             raise DqliteConnectionError(f"Pool is closed (id={id(self)})")
-
-    async def _settle_initialize(
-        self, wanted: int, opened: list[DqliteConnection], *, failed: bool
-    ) -> bool:
-        async with self._condition:
-            failed = failed or self.closed
-            if failed:
-                self._size -= wanted
-            else:
-                self._idle.extend(opened)
-            self._condition.notify_all()
-        if failed:
-            self._initialized = False
-            await asyncio.gather(*(c.close() for c in opened), return_exceptions=True)
-        return failed
 
     @contextlib.asynccontextmanager
     async def acquire(self) -> AsyncIterator[DqliteConnection]:
@@ -276,25 +269,15 @@ class ConnectionPool:
         try:
             keep = await self._reset(conn)
         finally:
-            await self._shielded(self._give_back(conn, keep))
-
-    async def _give_back(self, conn: DqliteConnection, keep: bool) -> None:
-        async with self._condition:
-            if keep and not self.closed:
-                self._idle.append(conn)
-            else:
-                keep = False
-                self._size -= 1
-            self._condition.notify()
-        if not keep:
-            await self._close_quietly(conn)
-
-    async def _shielded[T](self, cleanup: Coroutine[Any, Any, T]) -> T:
-        """Run pool bookkeeping to completion even if the caller is cancelled again."""
-        task = asyncio.ensure_future(cleanup)
-        self._cleanups.add(task)
-        task.add_done_callback(self._cleanups.discard)
-        return await asyncio.shield(task)
+            async with self._condition:
+                if keep and not self.closed:
+                    self._idle.append(conn)
+                else:
+                    keep = False
+                    self._size -= 1
+                self._condition.notify()
+            if not keep:
+                await self._close_quietly(conn)
 
     async def _reset(self, conn: DqliteConnection) -> bool:
         """Roll back a possibly open transaction; False if the connection should be dropped."""
