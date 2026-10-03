@@ -115,6 +115,12 @@ class FakeProtocol:
         self.sent.append(sql)
         return (["x"], [[1]])
 
+    async def query_sql_typed(
+        self, db_id: int, sql: str, params: Any
+    ) -> tuple[list[str], list[int], list[list[int]], list[list[Any]]]:
+        self.sent.append(sql)
+        return (["x"], [1], [[1]], [[1]])
+
     def close(self) -> None:
         self.is_alive = False
 

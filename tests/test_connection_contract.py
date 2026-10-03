@@ -49,6 +49,21 @@ async def test_transaction_flag_follows_the_tracking_table(
     assert conn.in_transaction is expected
 
 
+@pytest.mark.parametrize(
+    "method", ["query_raw", "query_raw_typed", "fetch", "fetchall", "fetchone", "fetchval"]
+)
+async def test_query_methods_track_transaction_control(connected: Any, method: str) -> None:
+    conn, _ = connected()
+    await getattr(conn, method)("BEGIN")
+    assert conn.in_transaction is True
+    await getattr(conn, method)("COMMIT")
+    assert conn.in_transaction is False
+    await getattr(conn, method)("SAVEPOINT a")
+    assert conn.in_transaction is True
+    await getattr(conn, method)("ROLLBACK")
+    assert conn.in_transaction is False
+
+
 async def test_no_transaction_reply_clears_flag_without_invalidating(connected: Any) -> None:
     conn, proto = connected()
     await conn.execute("SAVEPOINT a")
